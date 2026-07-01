@@ -1,0 +1,321 @@
+/*
+  Prototipe Sistem Peringatan Kantuk v3 — LED Strip + DFPlayer Mini
+  ==================================================================
+  Hardware:
+    - Active Buzzer         : + → D9,  − → GND
+    - Vibration Motor Module: VCC → 5V, GND → GND, SIG → D7
+    - WS2812B LED Strip     : 5V (adaptor) → 5V, GND → GND, DIN → (470Ω) → D6
+    - DFPlayer Mini         : VCC → 5V (adaptor), GND → GND,
+                              RX ← (1kΩ) ← D10
+                              (TX dan BUSY tidak dipakai)
+    - Speaker 3W 4Ω         : SPK1 & SPK2 dari DFPlayer Mini
+
+  CATATAN WIRING v3:
+    - Kabel D11 (DFPlayer TX) DICABUT — tidak diperlukan di mode no-ACK
+    - Kabel D8  (DFPlayer BUSY) DICABUT — diganti estimasi durasi software
+    - DFPlayer + LED Strip pakai sumber 5V terpisah (adaptor/ESP32 via VIN)
+    - GND adaptor WAJIB disambung ke GND Arduino
+
+  Library yang diperlukan (Manage Libraries):
+    1. Adafruit NeoPixel
+    2. DFRobotDFPlayerMini
+
+  SD Card:
+    - Format  : FAT32
+    - Struktur: /01/001.mp3   (folder "01", file "001.mp3")
+
+  Input via Serial Monitor (9600 baud):
+    ketik "1" + Enter → kantuk terdeteksi
+    ketik "0" + Enter → normal kembali
+*/
+
+#include <Adafruit_NeoPixel.h>
+#include <SoftwareSerial.h>
+#include <DFRobotDFPlayerMini.h>
+
+// ─── Pin ──────────────────────────────────────────────────────────────
+const int PIN_BUZZER    = 9;
+const int PIN_MOTOR     = 7;
+const int PIN_LED_STRIP = 6;
+const int PIN_DF_RX     = 11;   // Arduino RX ← DFPlayer TX (kabel ini tetap pasang)
+const int PIN_DF_TX     = 10;   // Arduino TX → DFPlayer RX (via 1kΩ)
+
+// ─── LED Strip ────────────────────────────────────────────────────────
+const int NUM_LEDS  = 22;
+const int KECERAHAN = 50;
+
+Adafruit_NeoPixel strip(NUM_LEDS, PIN_LED_STRIP, NEO_GRB + NEO_KHZ800);
+
+// ─── DFPlayer ─────────────────────────────────────────────────────────
+SoftwareSerial dfSerial(PIN_DF_RX, PIN_DF_TX);
+DFRobotDFPlayerMini dfPlayer;
+bool dfReady = false;
+
+// ─── Warna LED ────────────────────────────────────────────────────────
+const uint8_t AMBER_R = 255, AMBER_G = 80,  AMBER_B = 0;
+const uint8_t RED_R   = 255, RED_G   = 0,   RED_B   = 0;
+
+// ─── Timer (ms) — versi DEMO ──────────────────────────────────────────
+const unsigned long T_C     =   500;
+const unsigned long T1      =  2000;
+const unsigned long T2      =  4000;
+const unsigned long T_R     =  3000;
+const unsigned long T_RESET =  8000;
+const unsigned long W       = 20000;
+const int           N_RECUR = 3;
+
+// Durasi file audio 001.mp3 — sesuaikan dengan durasi actual file kamu (ms)
+// Beri tambahan ~500ms dari durasi real agar tidak overlap
+const unsigned long AUDIO_DURATION = 1500UL;  // contoh: file 3.5 detik → set 4000
+
+// ─── State ────────────────────────────────────────────────────────────
+enum Stage { S0_NORMAL, S1_MILD, S2_MODERATE, S3_CRITICAL };
+Stage stage            = S0_NORMAL;
+Stage lastPrintedStage = S0_NORMAL;
+Stage lastAudioStage   = S0_NORMAL;
+
+int  flag      = 0;
+bool confirmed = false;
+
+bool          onActive          = false;
+bool          offActive         = true;
+unsigned long onStart           = 0;
+unsigned long offStart          = 0;
+int           deescStepsApplied = 0;
+
+unsigned long recurTimestamps[10];
+int           recurCount = 0;
+
+unsigned long lastShow      = 0;
+unsigned long lastAudioPlay = 0;
+
+// ─── Setup ────────────────────────────────────────────────────────────
+void setup() {
+  Serial.begin(9600);
+
+  pinMode(PIN_BUZZER, OUTPUT);
+  pinMode(PIN_MOTOR,  OUTPUT);
+  digitalWrite(PIN_BUZZER, LOW);
+  digitalWrite(PIN_MOTOR,  LOW);
+
+  strip.begin();
+  strip.setBrightness(KECERAHAN);
+  strip.clear();
+  strip.show();
+
+  // DFPlayer butuh waktu boot
+  dfSerial.begin(9600);
+  delay(1000);
+
+  // false = mode no-ACK: non-blocking, tidak tunggu balasan DFPlayer
+  // Ini mencegah loop freeze di siklus input kedua
+  if (!dfPlayer.begin(dfSerial, false)) {
+    Serial.println("[DFPlayer] GAGAL — cek kabel & SD card.");
+    Serial.println("           Pastikan: resistor 1k di D10, folder /01/, file 001.mp3");
+  } else {
+    dfReady = true;
+    dfPlayer.volume(25);
+    dfPlayer.EQ(DFPLAYER_EQ_NORMAL);
+    Serial.println("[DFPlayer] OK — volume 25/30");
+  }
+
+  Serial.println("=== Sistem Peringatan Kantuk v3 ===");
+  Serial.println("Ketik 0 (normal) atau 1 (kantuk) lalu tekan Enter.");
+}
+
+// ─── Loop ─────────────────────────────────────────────────────────────
+void loop() {
+  readSerialFlag();
+  updateTimers();
+  updateStage();
+  printStageIfChanged();
+  handleAudio();
+  driveOutputs();
+}
+
+// ─── Serial input ─────────────────────────────────────────────────────
+void readSerialFlag() {
+  while (Serial.available() > 0) {
+    char c = Serial.read();
+    if (c == '1')      { flag = 1; Serial.println("[INPUT] kantuk terdeteksi"); }
+    else if (c == '0') { flag = 0; Serial.println("[INPUT] normal"); }
+  }
+}
+
+// ─── Timer & rekurensi ────────────────────────────────────────────────
+void updateTimers() {
+  unsigned long now = millis();
+  if (flag == 1) {
+    if (!onActive)  { onActive = true;  onStart = now; }
+    if (offActive)  { offActive = false; deescStepsApplied = 0; }
+    if (!confirmed && (now - onStart) >= T_C) {
+      confirmed = true;
+      recordRecurrence(now);
+    }
+  } else {
+    if (!offActive) { offActive = true; offStart = now; }
+    if (onActive)     onActive = false;
+    confirmed = false;
+  }
+}
+
+void recordRecurrence(unsigned long now) {
+  if (recurCount < 10) {
+    recurTimestamps[recurCount++] = now;
+  } else {
+    for (int i = 0; i < 9; i++) recurTimestamps[i] = recurTimestamps[i + 1];
+    recurTimestamps[9] = now;
+  }
+}
+
+int countRecentRecurrence(unsigned long now) {
+  int count = 0;
+  for (int i = 0; i < recurCount; i++)
+    if (now - recurTimestamps[i] <= W) count++;
+  return count;
+}
+
+// ─── State machine ────────────────────────────────────────────────────
+void updateStage() {
+  unsigned long now = millis();
+  if (confirmed) {
+    unsigned long dur = now - onStart;
+    Stage target = (dur >= T2) ? S3_CRITICAL
+                 : (dur >= T1) ? S2_MODERATE
+                 : S1_MILD;
+    if (countRecentRecurrence(now) >= N_RECUR && target < S2_MODERATE)
+      target = S2_MODERATE;
+    if (target > stage) stage = target;
+  } else if (offActive) {
+    unsigned long offDur = now - offStart;
+    if (offDur >= T_RESET) {
+      stage = S0_NORMAL;
+      recurCount = 0;
+      deescStepsApplied = 0;
+    } else {
+      int steps = (int)(offDur / T_R);
+      if (steps > deescStepsApplied) {
+        for (int i = 0; i < steps - deescStepsApplied; i++)
+          if (stage > S0_NORMAL) stage = (Stage)((int)stage - 1);
+        deescStepsApplied = steps;
+      }
+    }
+  }
+}
+
+// ─── Audio ────────────────────────────────────────────────────────────
+
+// Estimasi apakah audio masih diputar berdasarkan waktu
+// Lebih reliable dari pin BUSY untuk klon DFPlayer
+bool isDFBusy() {
+  if (lastAudioPlay == 0) return false;
+  return (millis() - lastAudioPlay) < AUDIO_DURATION;
+}
+
+void playWakeUp() {
+  if (!dfReady) return;
+  dfPlayer.playFolder(1, 1);   // folder /01/, file 001.mp3
+  lastAudioPlay = millis();
+  Serial.println("[AUDIO] Memutar 001.mp3");
+}
+
+void handleAudio() {
+  if (!dfReady) return;
+
+  // ── S0 Normal: hentikan audio ─────────────────────────────────────
+  if (stage == S0_NORMAL) {
+    if (lastAudioStage != S0_NORMAL) {
+      dfPlayer.stop();
+      Serial.println("[AUDIO] Stop");
+      lastAudioStage = S0_NORMAL;
+      lastAudioPlay  = 0;  // reset agar siklus berikutnya langsung bunyi
+    }
+    return;
+  }
+
+  // ── Stage aktif (S1/S2/S3): putar & ulang terus sampai input 0 ───
+  // Putar ulang otomatis setiap kali audio selesai
+  if (!isDFBusy()) {
+    playWakeUp();
+    lastAudioStage = stage;
+  }
+}
+
+// ─── Output per tahap ─────────────────────────────────────────────────
+void driveOutputs() {
+  switch (stage) {
+    case S0_NORMAL:
+      digitalWrite(PIN_BUZZER, LOW);
+      digitalWrite(PIN_MOTOR,  LOW);
+      setStripColor(0, 0, 0);
+      break;
+
+    case S1_MILD:
+      beepSingle(100, 2000);
+      digitalWrite(PIN_MOTOR, LOW);
+      setStripColor(AMBER_R, AMBER_G, AMBER_B);
+      break;
+
+    case S2_MODERATE:
+      beepDouble(120, 160, 1200);
+      pulseMotor(300, 300);
+      blinkStrip(AMBER_R, AMBER_G, AMBER_B, 500);
+      break;
+
+    case S3_CRITICAL:
+      beepSingle(220, 380);
+      pulseMotor(450, 80);
+      blinkStrip(RED_R, RED_G, RED_B, 330);
+      break;
+  }
+}
+
+// ─── Buzzer patterns ──────────────────────────────────────────────────
+void beepSingle(unsigned long onMs, unsigned long periodMs) {
+  unsigned long phase = millis() % periodMs;
+  digitalWrite(PIN_BUZZER, phase < onMs ? HIGH : LOW);
+}
+
+void beepDouble(unsigned long beepMs, unsigned long gapMs, unsigned long periodMs) {
+  unsigned long phase   = millis() % periodMs;
+  unsigned long b2Start = beepMs + gapMs;
+  unsigned long b2End   = b2Start + beepMs;
+  bool on = (phase < beepMs) || (phase >= b2Start && phase < b2End);
+  digitalWrite(PIN_BUZZER, on ? HIGH : LOW);
+}
+
+// ─── Motor ────────────────────────────────────────────────────────────
+void pulseMotor(unsigned long onMs, unsigned long offMs) {
+  unsigned long phase = millis() % (onMs + offMs);
+  digitalWrite(PIN_MOTOR, phase < onMs ? HIGH : LOW);
+}
+
+// ─── LED Strip ────────────────────────────────────────────────────────
+void showStrip() {
+  unsigned long now = millis();
+  if (now - lastShow >= 20) { strip.show(); lastShow = now; }
+}
+
+void setStripColor(uint8_t r, uint8_t g, uint8_t b) {
+  strip.fill(strip.Color(r, g, b));
+  showStrip();
+}
+
+void blinkStrip(uint8_t r, uint8_t g, uint8_t b, unsigned long periodMs) {
+  bool on = (millis() % periodMs) < (periodMs / 2);
+  strip.fill(on ? strip.Color(r, g, b) : 0);
+  showStrip();
+}
+
+// ─── Log stage ────────────────────────────────────────────────────────
+void printStageIfChanged() {
+  if (stage == lastPrintedStage) return;
+  Serial.print("[STAGE] ");
+  switch (stage) {
+    case S0_NORMAL:   Serial.println("S0 — Normal");                  break;
+    case S1_MILD:     Serial.println("S1 — Mild    (amber steady)");   break;
+    case S2_MODERATE: Serial.println("S2 — Moderate (amber blink)");   break;
+    case S3_CRITICAL: Serial.println("S3 — CRITICAL (merah blink!)");  break;
+  }
+  lastPrintedStage = stage;
+}
