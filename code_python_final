@@ -1,0 +1,928 @@
+"""
+detect_drowsy_webcam_v6.py — Hybrid Rule + Model + Arduino v6 (dua arah)
+=====================================================================
+Kompatibel dengan:
+  • MediaPipe terbaru → Tasks API (FaceLandmarker) — otomatis
+  • MediaPipe 0.10.14 → Solutions API (FaceMesh)   — fallback otomatis
+  • Python 3.8 – 3.13+
+
+Logika deteksi kantuk:
+  1. RULE BYPASS (event-based, langsung trigger "Kantuk"):
+       - Mata tertutup kontinu > 0.5 detik (microsleep), ATAU
+       - Satu kejadian menguap > 3 detik
+  2. Kalau rule TIDAK terpenuhi, gunakan MODEL XGBoost 3-fitur
+     (model_utama_eye_nomicrosleep.pkl: Blink Duration, Blink Frequency,
+     PERCLOS) yang dihitung dari sliding window 60 detik, digeser tiap
+     1 detik.
+  3. Model tetap dihitung & dicatat ke log walau rule sedang aktif
+     (untuk keperluan evaluasi/logging), tapi keputusan akhir memakai
+     rule kalau rule aktif.
+  4. STAGE KANTUK (S0-S3): dihitung dari counter n (0-6) yang naik-turun
+     tiap window_second (1 detik), berdasarkan final_status gabungan
+     (rule + model) saat itu:
+       - final_status == "Kantuk"  -> n = min(n+1, 6)
+       - final_status == "Terjaga" -> n = max(n-1, 0)
+     Pemetaan n -> stage:
+       n=0        -> S0 (Terjaga)
+       n=1        -> S1
+       n=2 s.d. 3 -> S2
+       n=4 s.d. 6 -> S3
+     Ini bersifat hysteresis: flicker sesaat ke "Terjaga" cuma menurunkan
+     n sebesar 1, tidak langsung menjatuhkan stage ke S0.
+
+  KOMUNIKASI SERIAL DENGAN ARDUINO v6 (sesuai Warning_System_Design
+  Subtopik3_KAI_v4.docx — state machine S0-S3 dipindah ke Python,
+  Arduino hanya menjalankan buzzer/motor sesuai kode yang diterima):
+
+    Python -> Arduino (1 karakter, dikirim hanya saat berubah):
+        '0'-'3' = Stage S0-S3
+        '4'     = wajah tidak terdeteksi (override stage, prioritas tertinggi)
+        '5'     = fitur mata/mulut/landmark tidak terdeteksi (override stage)
+
+    Arduino -> Python (dikirim saat tombol ditekan):
+        'R' = tombol D2 (re-calibrate) -> Python mengulang kalibrasi kamera
+        'F' = tombol D3 (force stop)   -> Python reset state deteksi &
+              model ke S0 (buffer window, counter n, microsleep/yawn
+              tracker), TANPA mengulang kalibrasi kamera
+
+  CATATAN PENTING (perlu kamu verifikasi sendiri):
+  - PERCLOS di sini dihitung sebagai proporsi WAKTU status mata "closed"
+    (EAR di bawah ambang biner) dalam window, BUKAN literal "kelopak
+    menutup >=80%" — karena kode landmark saat ini hanya menghasilkan
+    status open/closed biner, bukan persentase penutupan bertahap.
+  - Skala fitur window 60 detik diasumsikan SEBANDING dengan skala fitur
+    saat training (yang katamu dihitung per 1 menit). Kalau ternyata beda
+    metodologi ekstraksinya, threshold 0.41 pada model bisa perlu
+    dikalibrasi ulang.
+  - Simulasi awal menunjukkan model bisa cenderung agresif menandai
+    "Kantuk" bahkan untuk pola kedip normal — sudah divalidasi lewat
+    mode testing (test_drowsy_model.py) sebelumnya, tetap pantau di
+    lapangan sebelum dipakai untuk keputusan operasional.
+
+Model yang diunduh otomatis:
+  • face_yolov8n.pt       (~6MB)  — YOLO face detector
+  • face_landmarker.task  (~3MB)  — hanya jika Tasks API dipakai
+
+File yang wajib ada di folder yang sama:
+  • model_utama_eye_nomicrosleep.pkl  — hasil export pipeline TA v7
+
+Setup:
+  pip install ultralytics mediapipe opencv-python pyserial numpy joblib xgboost scikit-learn
+  python detect_drowsy_webcam_v6.py   → tekan Q untuk keluar
+
+Output tambahan:
+  • log_deteksi_kantuk.csv — dicatat tiap update window (append mode)
+"""
+
+import cv2
+import time
+import math
+import os
+import csv
+import serial
+import urllib.request
+import numpy as np
+import joblib
+from collections import deque
+from ultralytics import YOLO
+
+# ═══════════════════════════════════════════════════════════════════════
+#  MEDIAPIPE — DETEKSI VERSI & PILIH API OTOMATIS
+# ═══════════════════════════════════════════════════════════════════════
+
+import mediapipe as mp
+
+_USE_TASKS         = False
+_mp_tasks_python   = None
+_mp_tasks_vision   = None
+_FaceMeshSolutions = None
+
+# Coba Tasks API dulu (MediaPipe terbaru)
+try:
+    from mediapipe.tasks import python as _mp_tasks_python
+    from mediapipe.tasks.python import vision as _mp_tasks_vision
+    _USE_TASKS = True
+except (ImportError, AttributeError):
+    pass
+
+# Jika Tasks API tidak ada, fallback ke Solutions API (MediaPipe lama)
+if not _USE_TASKS:
+    try:
+        from mediapipe.python.solutions.face_mesh import FaceMesh as _FaceMeshSolutions
+    except ImportError:
+        try:
+            _FaceMeshSolutions = mp.solutions.face_mesh.FaceMesh
+        except AttributeError:
+            raise ImportError(
+                f"MediaPipe {mp.__version__} tidak kompatibel.\n"
+                "Coba: pip install mediapipe  atau  pip install mediapipe==0.10.14"
+            )
+
+print(f"MediaPipe {mp.__version__} — "
+      f"{'Tasks API (FaceLandmarker)' if _USE_TASKS else 'Solutions API (FaceMesh)'}")
+
+# ═══════════════════════════════════════════════════════════════════════
+#  KONFIGURASI
+# ═══════════════════════════════════════════════════════════════════════
+
+YOLO_WEIGHTS  = "face_yolov8n.pt"
+WEBCAM_IDX    = 0
+YOLO_INTERVAL = 5      # YOLO jalan 1 dari setiap N frame
+
+N_CALIB       = 100
+EAR_MULT      = 0.75
+MAR_MULT      = 1.40
+T_MOUTH_FLOOR = 0.10
+CROP_PADDING  = 20
+
+MICROSLEEP_LIMIT   = 2.0
+YAWN_LIMIT         = 3.0
+BLINK_MIN_DURATION = 0.5   # detik — blink normal < 0.4s, tidak trigger
+YAWN_MIN_DURATION  = 3.0   # detik — bicara biasa < 1s, tidak trigger
+
+# ── Model XGBoost (Eye_NoMicrosleep, 3 fitur) ──────────────────────────
+MODEL_PATH = "model_utama_eye_d_revisi.pkl"
+WINDOW_SECONDS = 60          # panjang sliding window fitur mata
+FEATURE_UPDATE_INTERVAL = 1.0  # hitung ulang fitur & prediksi tiap 1 detik
+
+# Ambang event yang bypass model (langsung "Kantuk", model tetap
+# dihitung paralel hanya untuk logging, sesuai kesepakatan)
+MICROSLEEP_EVENT_THRESHOLD = 0.5   # detik — mata tertutup kontinu
+YAWN_EVENT_THRESHOLD       = 3.0   # detik — satu kejadian menguap
+
+# Stage kantuk dari counter n (naik/turun tiap window_second, bukan timer
+# durasi kontinu). n bertambah 1 tiap window terdeteksi "Kantuk", berkurang
+# 1 tiap window terdeteksi "Terjaga", dibatasi 0-6.
+N_KANTUK_MIN = 0
+N_KANTUK_MAX = 6
+
+LOG_PATH = "log_deteksi_kantuk.csv"
+
+# ── Serial ke Arduino v6 ────────────────────────────────────────────────
+SERIAL_PORT = "COM5"
+SERIAL_BAUD = 9600
+
+# Python -> Arduino: '0'-'3' stage, '4' wajah hilang, '5' fitur wajah hilang
+STAGE_TO_CODE      = {"S0": "0", "S1": "1", "S2": "2", "S3": "3"}
+CODE_NO_FACE       = "4"
+CODE_FEATURE_MISSING = "5"
+
+# Arduino -> Python: 'R' re-calibrate, 'F' force stop (reset model/state)
+SIGNAL_RECALIBRATE = "R"
+SIGNAL_FORCE_STOP  = "F"
+
+# Delay agar warning tidak langsung aktif karena 1 frame gagal deteksi
+NO_FACE_DELAY = 1.0          # detik
+FEATURE_MISSING_DELAY = 1.0  # detik
+
+LEFT_EYE_IDX  = [362, 385, 387, 263, 373, 380]
+RIGHT_EYE_IDX = [33, 160, 158, 133, 153, 144]
+UPPER_LIP     = 13
+LOWER_LIP     = 14
+LEFT_MOUTH    = 308
+RIGHT_MOUTH   = 78
+
+# ═══════════════════════════════════════════════════════════════════════
+#  AUTO-DOWNLOAD MODEL YOLO
+# ═══════════════════════════════════════════════════════════════════════
+
+if not os.path.exists(YOLO_WEIGHTS):
+    url = "https://huggingface.co/Bingsu/adetailer/resolve/main/face_yolov8n.pt"
+    print(f"Mengunduh {YOLO_WEIGHTS}...")
+    try:
+        urllib.request.urlretrieve(url, YOLO_WEIGHTS)
+        print("Download selesai.\n")
+    except Exception as e:
+        raise RuntimeError(
+            f"Gagal download: {e}\n"
+            f"Download manual dari:\n  {url}\n"
+            f"Simpan sebagai '{YOLO_WEIGHTS}' di folder yang sama dengan script."
+        )
+
+# ═══════════════════════════════════════════════════════════════════════
+#  WRAPPER MEDIAPIPE — interface sama untuk Tasks API & Solutions API
+# ═══════════════════════════════════════════════════════════════════════
+
+class FaceLandmarkDetector:
+    """
+    Wrapper universal MediaPipe.
+    - Tasks API (versi baru)    : FaceLandmarker + face_landmarker.task
+    - Solutions API (versi lama): FaceMesh
+
+    Interface tunggal: get_landmarks(rgb_image) → list landmark | None
+    Landmark memiliki atribut .x dan .y (normalized 0.0–1.0)
+    """
+
+    _LANDMARKER_PATH = "face_landmarker.task"
+    _LANDMARKER_URL  = (
+        "https://storage.googleapis.com/mediapipe-models/"
+        "face_landmarker/face_landmarker/float16/latest/face_landmarker.task"
+    )
+
+    def __init__(self):
+        self._detector = None
+        self._last_ts  = 0   # untuk memastikan timestamp monoton (Tasks API)
+
+        if _USE_TASKS:
+            self._setup_tasks()
+        else:
+            self._setup_solutions()
+
+    def _setup_tasks(self):
+        """Inisialisasi FaceLandmarker (Tasks API — MediaPipe terbaru)."""
+        if not os.path.exists(self._LANDMARKER_PATH):
+            print(f"Mengunduh face_landmarker.task (~3MB)...")
+            try:
+                urllib.request.urlretrieve(self._LANDMARKER_URL, self._LANDMARKER_PATH)
+                print("Download selesai.")
+            except Exception as e:
+                raise RuntimeError(
+                    f"Gagal download face_landmarker.task: {e}\n"
+                    f"Download manual dari:\n  {self._LANDMARKER_URL}\n"
+                    f"Simpan di folder yang sama dengan script."
+                )
+
+        base_options = _mp_tasks_python.BaseOptions(
+            model_asset_path=self._LANDMARKER_PATH
+        )
+        options = _mp_tasks_vision.FaceLandmarkerOptions(
+            base_options=base_options,
+            running_mode=_mp_tasks_vision.RunningMode.VIDEO,
+            num_faces=1,
+            min_face_detection_confidence=0.5,
+            min_face_presence_confidence=0.5,
+            min_tracking_confidence=0.5
+        )
+        self._detector = _mp_tasks_vision.FaceLandmarker.create_from_options(options)
+        print("FaceLandmarkDetector siap (Tasks API)")
+
+    def _setup_solutions(self):
+        """Inisialisasi FaceMesh (Solutions API — MediaPipe lama)."""
+        self._detector = _FaceMeshSolutions(
+            static_image_mode=False,
+            max_num_faces=1,
+            refine_landmarks=True,
+            min_detection_confidence=0.5,
+            min_tracking_confidence=0.5
+        )
+        print("FaceLandmarkDetector siap (Solutions API)")
+
+    def get_landmarks(self, rgb_image: np.ndarray):
+        """
+        Proses gambar RGB (H×W×3), return list landmark atau None.
+        Setiap landmark: .x, .y normalized ke [0, 1].
+        """
+        if _USE_TASKS:
+            mp_img = mp.Image(image_format=mp.ImageFormat.SRGB, data=rgb_image)
+            # Pastikan timestamp selalu naik (syarat VIDEO mode)
+            ts_ms = max(int(time.time() * 1000), self._last_ts + 1)
+            self._last_ts = ts_ms
+            result = self._detector.detect_for_video(mp_img, ts_ms)
+            if result.face_landmarks:
+                return result.face_landmarks[0]
+        else:
+            result = self._detector.process(rgb_image)
+            if result.multi_face_landmarks:
+                return result.multi_face_landmarks[0].landmark
+
+        return None
+
+    def close(self):
+        try:
+            if self._detector is not None:
+                self._detector.close()
+        except Exception:
+            pass
+
+# ═══════════════════════════════════════════════════════════════════════
+#  INISIALISASI MODEL & KAMERA
+# ═══════════════════════════════════════════════════════════════════════
+
+print("Memuat YOLOv8n-face...")
+yolo_model = YOLO(YOLO_WEIGHTS)
+
+print("Memuat FaceLandmarkDetector...")
+face_detector = FaceLandmarkDetector()
+
+cap = cv2.VideoCapture(WEBCAM_IDX)
+cap.set(cv2.CAP_PROP_FRAME_WIDTH,  640)
+cap.set(cv2.CAP_PROP_FRAME_HEIGHT, 480)
+if not cap.isOpened():
+    raise RuntimeError("Webcam tidak ditemukan. Coba ubah WEBCAM_IDX ke 1 atau 2.")
+
+print("Memuat model XGBoost (Eye_NoMicrosleep)...")
+if not os.path.exists(MODEL_PATH):
+    raise RuntimeError(
+        f"File model '{MODEL_PATH}' tidak ditemukan. "
+        "Taruh file .pkl di folder yang sama dengan script ini."
+    )
+_model_dict   = joblib.load(MODEL_PATH)
+MODEL         = _model_dict["model"]
+MODEL_THRESH  = _model_dict["threshold"]
+MODEL_FEATURES = _model_dict["features"]  # urutan wajib: sesuai training
+MODEL_LABELS  = _model_dict["label_map"]
+print(f"  Fitur   : {MODEL_FEATURES}")
+print(f"  Threshold: {MODEL_THRESH}\n")
+
+print(f"Menghubungkan ke Arduino di {SERIAL_PORT}...")
+try:
+    arduino = serial.Serial(SERIAL_PORT, SERIAL_BAUD, timeout=0)
+    time.sleep(2)
+    print(f"[Serial] Terhubung ke {SERIAL_PORT} ✓\n")
+except Exception as e:
+    raise RuntimeError(
+        f"Gagal konek ke {SERIAL_PORT}: {e}\n"
+        "Pastikan: Arduino tersambung, port benar, "
+        "Serial Monitor Arduino IDE sudah ditutup."
+    )
+
+last_code_sent = None
+
+
+def send_arduino(code):
+    """Kirim 1 karakter kode ke Arduino, hanya kalau berubah dari sebelumnya."""
+    global last_code_sent
+    code = str(code)
+    if code != last_code_sent:
+        try:
+            arduino.write(code.encode())
+            last_code_sent = code
+        except Exception as e:
+            print(f"[Serial] Error kirim: {e}")
+
+
+def read_arduino_signals():
+    """Baca semua baris yang tersedia dari Arduino, non-blocking.
+    Arduino juga mengirim banyak baris log/debug (mis. "[STAGE] ..."), jadi
+    hanya baris yang PERSIS 'R' atau 'F' yang dianggap sinyal tombol.
+    Mengembalikan list sinyal ('R'/'F') yang ditemukan pada panggilan ini.
+    """
+    signals = []
+    try:
+        while arduino.in_waiting > 0:
+            raw = arduino.readline().decode(errors="ignore").strip()
+            if raw == SIGNAL_RECALIBRATE or raw == SIGNAL_FORCE_STOP:
+                signals.append(raw)
+            elif raw:
+                # Baris log/debug Arduino lain -> tampilkan saja, tidak diproses
+                print(f"[Arduino] {raw}")
+    except Exception as e:
+        print(f"[Serial] Error baca: {e}")
+    return signals
+
+# ═══════════════════════════════════════════════════════════════════════
+#  FUNGSI
+# ═══════════════════════════════════════════════════════════════════════
+
+def apply_clahe(frame):
+    lab = cv2.cvtColor(frame, cv2.COLOR_BGR2LAB)
+    l, a, b = cv2.split(lab)
+    clahe = cv2.createCLAHE(clipLimit=2.0, tileGridSize=(8, 8))
+    l = clahe.apply(l)
+    return cv2.cvtColor(cv2.merge([l, a, b]), cv2.COLOR_LAB2BGR)
+
+
+def _dist(p1, p2):
+    return math.sqrt((p1[0]-p2[0])**2 + (p1[1]-p2[1])**2)
+
+
+def compute_ear(lm, idx, w, h):
+    pts = [(lm[i].x * w, lm[i].y * h) for i in idx]
+    v1  = _dist(pts[1], pts[5])
+    v2  = _dist(pts[2], pts[4])
+    hz  = _dist(pts[0], pts[3])
+    return (v1 + v2) / (2.0 * hz) if hz > 1e-6 else 0.0
+
+
+def compute_mar(lm, w, h):
+    ul = (lm[UPPER_LIP].x * w, lm[UPPER_LIP].y * h)
+    ll = (lm[LOWER_LIP].x * w, lm[LOWER_LIP].y * h)
+    ml = (lm[LEFT_MOUTH].x * w, lm[LEFT_MOUTH].y * h)
+    mr = (lm[RIGHT_MOUTH].x * w, lm[RIGHT_MOUTH].y * h)
+    hz = _dist(ml, mr)
+    return _dist(ul, ll) / hz if hz > 1e-6 else 0.0
+
+
+_cached_bbox    = None
+_yolo_frame_cnt = 0
+
+
+def detect_and_extract(frame, img_w, img_h):
+    global _cached_bbox, _yolo_frame_cnt
+
+    frame_c = apply_clahe(frame)
+    _yolo_frame_cnt += 1
+
+    # YOLO hanya jalan setiap YOLO_INTERVAL frame, sisanya pakai cache
+    if _yolo_frame_cnt % YOLO_INTERVAL == 1 or _cached_bbox is None:
+        res   = yolo_model(frame_c, verbose=False)
+        boxes = res[0].boxes
+        if len(boxes) > 0:
+            confs    = boxes.conf.cpu().numpy()
+            best_idx = int(np.argmax(confs))
+            b        = boxes[best_idx].xyxy[0].cpu().numpy().astype(int)
+            _cached_bbox = (
+                max(0,     b[0] - CROP_PADDING),
+                max(0,     b[1] - CROP_PADDING),
+                min(img_w, b[2] + CROP_PADDING),
+                min(img_h, b[3] + CROP_PADDING),
+            )
+        else:
+            _cached_bbox = None
+
+    if _cached_bbox is None:
+        return False, None, None, None, None, None
+
+    x1, y1, x2, y2 = _cached_bbox
+    crop = frame_c[y1:y2, x1:x2]
+    if crop.size == 0:
+        _cached_bbox = None
+        return False, None, None, None, None, None
+
+    ch, cw   = crop.shape[:2]
+    rgb_crop = cv2.cvtColor(crop, cv2.COLOR_BGR2RGB)
+    lm       = face_detector.get_landmarks(rgb_crop)
+
+    if lm is None:
+        return False, None, None, None, None, _cached_bbox
+
+    el = compute_ear(lm, LEFT_EYE_IDX,  cw, ch)
+    er = compute_ear(lm, RIGHT_EYE_IDX, cw, ch)
+    ea = (el + er) / 2.0
+    m  = compute_mar(lm, cw, ch)
+
+    return True, round(el,4), round(er,4), round(ea,4), round(m,4), _cached_bbox
+
+
+def trim_window(buf, now, window_seconds):
+    """Buang entri yang sudah lebih tua dari window_seconds detik dari 'now'.
+    Setiap entri buffer diasumsikan tuple yang elemen pertamanya timestamp.
+    """
+    while buf and (now - buf[0][0]) > window_seconds:
+        buf.popleft()
+
+
+def compute_window_features(now, blink_events_buffer, frame_state_buffer):
+    """
+    Hitung 3 fitur (Blink Duration, Blink Frequency, PERCLOS) dari sliding
+    window WINDOW_SECONDS detik terakhir.
+
+    - Blink Frequency : jumlah kedipan (durasi < MICROSLEEP_EVENT_THRESHOLD)
+                        yang selesai dalam window (count, sama seperti skala
+                        data training).
+    - Blink Duration  : rata-rata durasi kedipan tsb (detik).
+    - PERCLOS         : proporsi waktu (0-1) mata tercatat "closed" dalam
+                        window, dari total waktu frame yang terekam.
+                        CATATAN: ini pendekatan biner (EAR di bawah ambang),
+                        bukan literal "kelopak menutup >=80%", karena kode
+                        deteksi saat ini hanya punya status open/closed biner.
+
+    Kedua buffer sudah di-trim ke window_seconds sebelum dipanggil.
+    """
+    blink_frequency = len(blink_events_buffer)
+    if blink_frequency > 0:
+        blink_duration = sum(d for _, d in blink_events_buffer) / blink_frequency
+    else:
+        blink_duration = 0.0
+
+    total_dt = sum(dt for _, dt, _ in frame_state_buffer)
+    closed_dt = sum(dt for _, dt, closed in frame_state_buffer if closed)
+    perclos = (closed_dt / total_dt) if total_dt > 1e-6 else 0.0
+
+    return blink_duration, blink_frequency, perclos
+
+
+def predict_model(blink_duration, blink_frequency, perclos):
+    """Jalankan model XGBoost 3-fitur, kembalikan (label_str, proba_kantuk)."""
+    nilai = {
+        "Blink Duration": blink_duration,
+        "Blink Frequency": blink_frequency,
+        "PERCLOS": perclos,
+    }
+    X = np.array([[nilai[f] for f in MODEL_FEATURES]])
+    proba = float(MODEL.predict_proba(X)[0, 1])
+    label = int(proba >= MODEL_THRESH)
+    return MODEL_LABELS[label], proba
+
+
+def stage_from_n(n):
+    """Peta counter n (0-6) ke stage kantuk.
+    n=0 -> S0 | n=1 -> S1 | n=2-3 -> S2 | n=4-6 -> S3
+    """
+    if n == 0:
+        return "S0"
+    elif n == 1:
+        return "S1"
+    elif n <= 3:
+        return "S2"
+    else:
+        return "S3"
+
+
+def draw_panel(height, ear_avg, mar, eye_state, mouth_state, is_alert,
+               model_label, model_proba, final_status, rule_triggered,
+               blink_freq_win, blink_dur_win, perclos_win,
+               kantuk_stage, n_kantuk):
+    panel = np.full((height, 280, 3), 28, dtype=np.uint8)
+
+    def put(txt, y, col=(170,170,170), sc=0.46, bold=False):
+        cv2.putText(panel, txt, (10, y), cv2.FONT_HERSHEY_SIMPLEX,
+                    sc, col, 2 if bold else 1, cv2.LINE_AA)
+
+    put("EAR/MAR Detector", 22, (210,210,210), 0.52, True)
+    cv2.line(panel, (8,29), (272,29), (70,70,70), 1)
+
+    ec = (90,90,230) if eye_state == "closed" else (60,200,60)
+    put(f"EAR avg  : {ear_avg:.3f}" if ear_avg is not None else "EAR avg  : ?",
+        50, ec, 0.42)
+    put(f"Mata     : {eye_state}", 68, ec, 0.44, True)
+
+    mc = (0,150,255) if mouth_state == "yawning" else (60,200,60)
+    put(f"MAR      : {mar:.3f}"     if mar     is not None else "MAR      : ?",
+        88, mc, 0.42)
+    put(f"Mulut    : {mouth_state}", 106, mc, 0.44, True)
+    cv2.line(panel, (8,116), (272,116), (60,60,60), 1)
+
+    put(f"Blinks      : {blinks}",              136, (175,175,175), 0.40)
+    put(f"Microsleep  : {microsleep_sec:.1f}s", 154, (175,175,175), 0.40)
+    put(f"Yawn durasi : {yawn_duration:.1f}s",  172, (175,175,175), 0.40)
+    cv2.line(panel, (8,182), (272,182), (60,60,60), 1)
+
+    put(f"Window {WINDOW_SECONDS:.0f}s (model input):", 202, (140,140,140), 0.40)
+    put(f"  Blink Freq   : {blink_freq_win}",            220, (175,175,175), 0.40)
+    put(f"  Blink Dur    : {blink_dur_win:.3f}s",         238, (175,175,175), 0.40)
+    put(f"  PERCLOS      : {perclos_win:.4f}",            256, (175,175,175), 0.40)
+    cv2.line(panel, (8,266), (272,266), (60,60,60), 1)
+
+    mlc = (90,90,230) if model_label == "Kantuk" else (60,200,60)
+    put(f"Model    : {model_label} (p={model_proba:.2f})", 286, mlc, 0.42, True)
+    put(f"Rule bypass: {'AKTIF' if rule_triggered else '-'}", 304,
+        (90,90,230) if rule_triggered else (110,110,110), 0.40)
+    cv2.line(panel, (8,314), (272,314), (60,60,60), 1)
+
+    fc = (90,90,230) if final_status == "Kantuk" else (60,200,60)
+    put("STATUS FINAL:", 334, (140,140,140), 0.42)
+    put(final_status.upper(), 356, fc, 0.58, True)
+
+    STAGE_COLORS = {
+        "S0": (60,200,60),    # hijau — terjaga
+        "S1": (0,190,230),    # kuning/cyan — awal
+        "S2": (0,140,255),    # oranye — sedang
+        "S3": (60,60,230),    # merah — parah
+    }
+    stg_col = STAGE_COLORS.get(kantuk_stage, (170,170,170))
+    put(f"Stage kantuk : {kantuk_stage}", 378, stg_col, 0.44, True)
+    put(f"Counter n    : {n_kantuk} / {N_KANTUK_MAX}", 396, stg_col, 0.38)
+    cv2.line(panel, (8,406), (272,406), (60,60,60), 1)
+
+    if is_alert:
+        msg = "MICROSLEEP!" if microsleep_sec > MICROSLEEP_LIMIT else "MENGUAP LAMA!"
+        cv2.rectangle(panel, (8,416), (272,458), (30,20,140), -1)
+        cv2.rectangle(panel, (8,416), (272,458), (90,80,220),  1)
+        put("!! ALERT !!",  435, (255,255,255), 0.50, True)
+        put(msg,            453, (210,200,255), 0.38)
+
+    return panel
+
+# ═══════════════════════════════════════════════════════════════════════
+#  STATE
+# ═══════════════════════════════════════════════════════════════════════
+
+phase     = "calibrating"
+ear_calib = []
+mar_calib = []
+t_eye     = None
+t_mouth   = None
+
+blinks           = 0
+microsleep_sec   = 0.0
+yawns            = 0
+yawn_duration    = 0.0
+eyes_was_closed  = False
+yawn_in_progress = False
+
+prev_time = time.time()
+no_face_started = None
+feature_missing_started = None
+face_missing_alert = False
+feature_missing_alert = False
+
+# ── Sliding window (60 detik) untuk fitur model & prediksi berjalan ────
+blink_events_buffer = deque()   # tiap entri: (timestamp_selesai, durasi)
+frame_state_buffer  = deque()   # tiap entri: (timestamp, dt, is_closed)
+last_feature_update = 0.0
+model_label   = "Terjaga"
+model_proba   = 0.0
+blink_freq_win = 0
+blink_dur_win  = 0.0
+perclos_win    = 0.0
+
+log_file = open(LOG_PATH, "a", newline="")
+log_writer = csv.writer(log_file)
+if log_file.tell() == 0:
+    log_writer.writerow([
+        "timestamp", "ear_avg", "mar", "eye_state", "mouth_state",
+        "blink_freq_window", "blink_duration_window", "perclos_window",
+        "model_label", "model_proba", "rule_triggered", "final_status",
+        "kantuk_stage", "n_kantuk",
+    ])
+
+# ── Tracking stage kantuk (S0-S3) via counter n naik/turun tiap detik ──
+last_stage_update = 0.0
+n_kantuk    = 0
+kantuk_stage = "S0"
+
+
+def handle_recalibrate():
+    """Sinyal 'R' dari tombol D2 -> ulangi kalibrasi kamera dari awal."""
+    global phase, ear_calib, mar_calib, t_eye, t_mouth
+    phase     = "calibrating"
+    ear_calib = []
+    mar_calib = []
+    t_eye     = None
+    t_mouth   = None
+    print("[Python] Sinyal 'R' diterima -> mengulang kalibrasi kamera.")
+
+
+def handle_force_stop():
+    """Sinyal 'F' dari tombol D3 -> reset state deteksi & model ke S0,
+    TANPA mengulang kalibrasi kamera (kalibrasi tetap terpakai)."""
+    global blink_events_buffer, frame_state_buffer
+    global n_kantuk, kantuk_stage, model_label, model_proba
+    global blink_freq_win, blink_dur_win, perclos_win
+    global microsleep_sec, yawn_duration, eyes_was_closed, yawn_in_progress
+    global last_feature_update, last_stage_update
+
+    blink_events_buffer.clear()
+    frame_state_buffer.clear()
+    n_kantuk      = 0
+    kantuk_stage  = "S0"
+    model_label   = "Terjaga"
+    model_proba   = 0.0
+    blink_freq_win = 0
+    blink_dur_win  = 0.0
+    perclos_win    = 0.0
+    microsleep_sec   = 0.0
+    yawn_duration    = 0.0
+    eyes_was_closed  = False
+    yawn_in_progress = False
+    last_feature_update = 0.0
+    last_stage_update   = 0.0
+    print("[Python] Sinyal 'F' diterima -> reset state deteksi & model ke S0.")
+
+
+def metrics_valid(ear_avg, mar):
+    """Validasi kasar agar nilai landmark yang tidak masuk akal bisa dianggap fitur tidak terbaca.
+    Catatan: MediaPipe tidak selalu memberi confidence per landmark, jadi ini hanya safety check.
+    """
+    if ear_avg is None or mar is None:
+        return False
+    if not (0.02 <= ear_avg <= 0.70):
+        return False
+    if not (0.00 <= mar <= 1.50):
+        return False
+    return True
+
+# ═══════════════════════════════════════════════════════════════════════
+#  MAIN LOOP
+# ═══════════════════════════════════════════════════════════════════════
+
+print(f"\nFase kalibrasi: hadapkan wajah ke kamera ({N_CALIB} frame valid).")
+print("Tekan Q untuk keluar.\n")
+
+while True:
+    ret, frame = cap.read()
+    if not ret:
+        break
+
+    now       = time.time()
+    dt        = now - prev_time
+    prev_time = now
+
+    # ── Baca sinyal tombol dari Arduino (non-blocking) ──────────────────
+    for sinyal in read_arduino_signals():
+        if sinyal == SIGNAL_RECALIBRATE:
+            handle_recalibrate()
+        elif sinyal == SIGNAL_FORCE_STOP:
+            handle_force_stop()
+
+    ih, iw = frame.shape[:2]
+    face_ok, el, er, ear_avg, mar, bbox = detect_and_extract(frame, iw, ih)
+
+    # ── FASE KALIBRASI ────────────────────────────────────────────────
+    if phase == "calibrating":
+        send_arduino(STAGE_TO_CODE["S0"])  # tetap normal selama kalibrasi
+
+        if face_ok:
+            ear_calib.append(ear_avg)
+            mar_calib.append(mar)
+
+        n_done = len(ear_calib)
+        ratio  = n_done / N_CALIB
+
+        ov = frame.copy()
+        cv2.rectangle(ov, (0, ih//2-60), (iw, ih//2+65), (20,20,20), -1)
+        cv2.addWeighted(ov, 0.75, frame, 0.25, 0, frame)
+
+        cv2.putText(frame, "KALIBRASI — hadapkan wajah ke kamera",
+                    (iw//2-195, ih//2-28),
+                    cv2.FONT_HERSHEY_SIMPLEX, 0.56, (200,200,200), 1, cv2.LINE_AA)
+
+        bw = iw - 80
+        cv2.rectangle(frame, (40, ih//2+2), (40+bw,            ih//2+24), (60,60,60),   -1)
+        cv2.rectangle(frame, (40, ih//2+2), (40+int(bw*ratio), ih//2+24), (60,200,60), -1)
+        cv2.putText(frame, f"{n_done} / {N_CALIB} frame valid",
+                    (iw//2-80, ih//2+48),
+                    cv2.FONT_HERSHEY_SIMPLEX, 0.52, (170,170,170), 1, cv2.LINE_AA)
+
+        if not face_ok:
+            cv2.putText(frame, "Wajah tidak terdeteksi...",
+                        (iw//2-110, ih//2-5),
+                        cv2.FONT_HERSHEY_SIMPLEX, 0.48, (80,80,230), 1, cv2.LINE_AA)
+
+        if n_done >= N_CALIB:
+            t_eye       = float(np.median(ear_calib)) * EAR_MULT
+            t_mouth_raw = float(np.median(mar_calib)) * MAR_MULT
+            t_mouth     = max(t_mouth_raw, T_MOUTH_FLOOR)
+            phase       = "detecting"
+            print("Kalibrasi selesai!")
+            print(f"  t_eye   = {t_eye:.4f}")
+            print(f"  t_mouth = {t_mouth:.4f}")
+            print("Deteksi model + rule aktif.\n")
+
+        cv2.imshow("Drowsiness Detection — Q untuk keluar", frame)
+        if cv2.waitKey(1) & 0xFF == ord("q"):
+            break
+        continue
+
+    # ── FASE DETEKSI ──────────────────────────────────────────────────
+    eye_state   = "unknown"
+    mouth_state = "unknown"
+
+    # Reset status missing setiap frame, lalu dihitung ulang
+    face_missing_alert = False
+    feature_missing_alert = False
+
+    rule_triggered = False
+
+    if face_ok and metrics_valid(ear_avg, mar):
+        no_face_started = None
+        feature_missing_started = None
+
+        eye_state   = "closed"  if ear_avg < t_eye   else "open"
+        mouth_state = "yawning" if mar     > t_mouth else "normal"
+
+        if eye_state == "closed":
+            if not eyes_was_closed:
+                eyes_was_closed = True
+                blinks += 1
+            microsleep_sec += dt
+        else:
+            if eyes_was_closed:
+                # Mata baru saja terbuka lagi -> satu closure selesai.
+                # microsleep_sec saat ini = durasi closure yang baru selesai.
+                closure_duration = microsleep_sec
+                if closure_duration < MICROSLEEP_EVENT_THRESHOLD:
+                    # Kedipan normal -> masuk statistik untuk model
+                    blink_events_buffer.append((now, closure_duration))
+                # Jika >= threshold, itu microsleep -> sudah ditangani rule,
+                # sengaja TIDAK dimasukkan ke statistik blink (konsisten
+                # dengan definisi training: blink != microsleep).
+            eyes_was_closed = False
+            microsleep_sec  = 0.0
+
+        # Catat status frame ini ke buffer window (untuk PERCLOS)
+        frame_state_buffer.append((now, dt, eye_state == "closed"))
+
+        if mouth_state == "yawning":
+            if not yawn_in_progress:
+                yawn_in_progress = True
+                yawns += 1
+            yawn_duration += dt
+        else:
+            if yawn_in_progress:
+                yawn_in_progress = False
+            yawn_duration = 0.0
+
+        # ── Rule bypass: microsleep atau menguap panjang -> langsung Kantuk
+        rule_triggered = (microsleep_sec > MICROSLEEP_EVENT_THRESHOLD or
+                           yawn_duration  > YAWN_EVENT_THRESHOLD)
+
+        # ── Sliding window: hitung ulang fitur & prediksi tiap 1 detik ──
+        trim_window(blink_events_buffer, now, WINDOW_SECONDS)
+        trim_window(frame_state_buffer, now, WINDOW_SECONDS)
+
+        if now - last_feature_update >= FEATURE_UPDATE_INTERVAL:
+            last_feature_update = now
+            blink_dur_win, blink_freq_win, perclos_win = compute_window_features(
+                now, blink_events_buffer, frame_state_buffer
+            )
+            model_label, model_proba = predict_model(
+                blink_dur_win, blink_freq_win, perclos_win
+            )
+
+        # ── Gabungkan: rule menang jika aktif, kalau tidak pakai model ──
+        final_status = "Kantuk" if rule_triggered else model_label
+
+    else:
+        eyes_was_closed  = False
+        yawn_in_progress = False
+        microsleep_sec   = 0.0
+        yawn_duration    = 0.0
+        final_status     = "Kantuk" if model_label == "Kantuk" else "Terjaga"
+
+        # bbox None  → YOLO tidak melihat wajah sama sekali.
+        # bbox ada tetapi face_ok False / metrik tidak valid → wajah ada, tetapi landmark mata/mulut gagal/invalid.
+        if bbox is None:
+            eye_state   = "no face"
+            mouth_state = "no face"
+            feature_missing_started = None
+            if no_face_started is None:
+                no_face_started = now
+            face_missing_alert = (now - no_face_started) >= NO_FACE_DELAY
+        else:
+            eye_state   = "landmark lost"
+            mouth_state = "landmark lost"
+            no_face_started = None
+            if feature_missing_started is None:
+                feature_missing_started = now
+            feature_missing_alert = (now - feature_missing_started) >= FEATURE_MISSING_DELAY
+
+    # ── Stage kantuk: counter n naik/turun tiap window_second (1 detik) ─
+    # berdasarkan final_status gabungan (rule bypass + model) saat itu.
+    if now - last_stage_update >= FEATURE_UPDATE_INTERVAL:
+        last_stage_update = now
+        if final_status == "Kantuk":
+            n_kantuk = min(n_kantuk + 1, N_KANTUK_MAX)
+        else:
+            n_kantuk = max(n_kantuk - 1, N_KANTUK_MIN)
+        kantuk_stage = stage_from_n(n_kantuk)
+
+    # ── Kirim ke Arduino: wajah/fitur hilang override stage kantuk ──────
+    if face_missing_alert:
+        send_arduino(CODE_NO_FACE)
+    elif feature_missing_alert:
+        send_arduino(CODE_FEATURE_MISSING)
+    else:
+        send_arduino(STAGE_TO_CODE.get(kantuk_stage, "0"))
+
+    if face_ok and metrics_valid(ear_avg, mar):
+        log_writer.writerow([
+            f"{now:.3f}", ear_avg, mar, eye_state, mouth_state,
+            blink_freq_win, f"{blink_dur_win:.4f}", f"{perclos_win:.5f}",
+            model_label, f"{model_proba:.4f}", rule_triggered, final_status,
+            kantuk_stage, n_kantuk,
+        ])
+
+    is_alert = (microsleep_sec > MICROSLEEP_LIMIT or
+                yawn_duration  > YAWN_LIMIT or
+                face_missing_alert or
+                feature_missing_alert or
+                final_status == "Kantuk")
+
+    if bbox:
+        x1, y1, x2, y2 = bbox
+        bc = (0,0,220) if is_alert else (60,200,60)
+        cv2.rectangle(frame, (x1,y1), (x2,y2), bc, 2)
+        if ear_avg is not None:
+            ec = (90,90,230) if eye_state == "closed" else (60,200,60)
+            cv2.putText(frame, f"EAR:{ear_avg:.3f}  MAR:{mar:.3f}",
+                        (x1, max(y1-7, 12)),
+                        cv2.FONT_HERSHEY_SIMPLEX, 0.38, ec, 1, cv2.LINE_AA)
+
+    if is_alert:
+        ov = frame.copy()
+        cv2.rectangle(ov, (0,0), (iw,46), (0,0,150), -1)
+        cv2.addWeighted(ov, 0.65, frame, 0.35, 0, frame)
+        if face_missing_alert:
+            msg = "!! WAJAH TIDAK TERDETEKSI !!"
+        elif feature_missing_alert:
+            msg = "!! MATA/MULUT TIDAK TERDETEKSI !!"
+        elif microsleep_sec > MICROSLEEP_LIMIT:
+            msg = f"!! MICROSLEEP ALERT ({kantuk_stage}) !!"
+        elif yawn_duration > YAWN_LIMIT:
+            msg = f"!! YAWN ALERT ({kantuk_stage}) !!"
+        else:
+            msg = f"!! KANTUK TERDETEKSI ({kantuk_stage}) !!"
+        cv2.putText(frame, msg, (10,32),
+                    cv2.FONT_HERSHEY_SIMPLEX, 0.82, (255,255,255), 2, cv2.LINE_AA)
+
+    panel   = draw_panel(ih, ear_avg, mar, eye_state, mouth_state, is_alert,
+                          model_label, model_proba, final_status, rule_triggered,
+                          blink_freq_win, blink_dur_win, perclos_win,
+                          kantuk_stage, n_kantuk)
+    display = np.hstack([frame, panel])
+    cv2.imshow("Drowsiness Detection — Q untuk keluar", display)
+
+    if cv2.waitKey(1) & 0xFF == ord("q"):
+        break
+
+# ── Cleanup ───────────────────────────────────────────────────────────
+send_arduino(STAGE_TO_CODE["S0"])
+cap.release()
+cv2.destroyAllWindows()
+face_detector.close()
+log_file.close()
+arduino.close()
+print(f"Log tersimpan di {LOG_PATH}")
+print("Selesai.")
