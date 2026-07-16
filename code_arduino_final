@@ -1,0 +1,362 @@
+/*
+  Prototipe Sistem Peringatan Kantuk v6
+  Update dari v5 -- PENYESUAIAN BESAR sesuai Warning_System_Design_Subtopik3_KAI_v4.docx:
+
+    1) STATE MACHINE S0-S3 DIPINDAH SEPENUHNYA KE PYTHON.
+       Arduino v5 ke bawah menghitung stage sendiri pakai timer lokal (T_C, T1, T2,
+       N_RECUR, dst) -- itu TIDAK sesuai dokumen rancangan (yang pakai buffer 60 detik +
+       model XGBoost + hitung "n" dari 6 panggilan model terakhir). Semua logika itu
+       sekarang dihapus dari Arduino. Arduino hanya menerima KODE STAGE (0-3) yang sudah
+       dihitung Python, lalu menjalankan buzzer + motor sesuai stage tsb.
+
+    2) Command SERIAL dari Python -> Arduino (BERUBAH, tidak lagi flag biner 0/1):
+         '0' = Stage S0 (normal)
+         '1' = Stage S1
+         '2' = Stage S2
+         '3' = Stage S3
+         '4' = wajah tidak terdeteksi (prioritas tertinggi, override stage)
+         '5' = fitur wajah (mata/mulut/landmark) tidak terdeteksi (override stage)
+
+    3) Command SERIAL dari Arduino -> Python (tombol D3 sekarang kirim sinyal juga):
+         'R' = tombol re-calibrate (D2) ditekan -- Python ulangi kalibrasi kamera
+         'F' = tombol FORCE STOP / feedback (D3) ditekan -- selain memutus output
+               secara lokal, Arduino juga kirim 'F' supaya Python mengosongkan fLog
+               dan set Stage=S0 di sisi Python (sesuai dokumen bagian 6.1 "Reset Manual"),
+               supaya begitu output nyala lagi tidak langsung lompat ke S3.
+
+    4) LED strip tetap tidak dipakai (sudah dihapus sejak v5). Diferensiasi stage
+       sepenuhnya lewat pola buzzer + getar motor.
+
+    5) Sistem tetap AKTIF OTOMATIS begitu Arduino dinyalakan -- tidak perlu tombol apapun.
+
+  Library:
+    - DFRobotDFPlayerMini
+
+  SD Card DFPlayer:
+    /01/001.mp3 = suara peringatan kantuk
+    /01/002.mp3 = suara "wajah tidak terdeteksi"
+    /01/003.mp3 = suara "mata atau mulut tidak terdeteksi"
+*/
+
+#include <SoftwareSerial.h>
+#include <DFRobotDFPlayerMini.h>
+
+// ─── Pin output ───────────────────────────────────────────────────────
+const int PIN_BUZZER    = 9;
+const int PIN_MOTOR     = 7;
+const int PIN_DF_RX     = 11;   // Arduino RX ← DFPlayer TX
+const int PIN_DF_TX     = 10;   // Arduino TX → DFPlayer RX via resistor 1kΩ
+
+// ─── Pin tombol ───────────────────────────────────────────────────────
+const int PIN_BTN_RECAL = 2;   // re-calibrate kamera (kirim 'R' ke Python)
+const int PIN_BTN_STOP  = 3;   // force stop + feedback (kirim 'F' ke Python)
+
+const int BUTTON_ACTIVE_STATE = HIGH;
+const unsigned long DEBOUNCE_MS = 50;
+
+// ─── DFPlayer ─────────────────────────────────────────────────────────
+SoftwareSerial dfSerial(PIN_DF_RX, PIN_DF_TX);
+DFRobotDFPlayerMini dfPlayer;
+bool dfReady = false;
+
+const unsigned long AUDIO_DROWSY_MS   = 1000UL;
+const unsigned long AUDIO_NO_FACE_MS  = 1500UL;
+const unsigned long AUDIO_FEATURE_MS  = 2500UL;
+const unsigned long AUDIO_REPEAT_MARGIN_MS = 500UL;
+
+// Force stop hanya membuat output diam sesaat, lalu sistem otomatis lanjut baca stage dari Python.
+const unsigned long FORCE_STOP_SILENT_MS = 1000UL;
+
+// ─── Command dari Python ────────────────────────────────────────────────
+enum InputCode { CMD_S0 = 0, CMD_S1 = 1, CMD_S2 = 2, CMD_S3 = 3, CMD_NO_FACE = 4, CMD_FEATURE_MISSING = 5 };
+InputCode inputCode = CMD_S0;
+
+// ─── Stage (ditentukan Python, Arduino hanya menjalankan) ─────────────
+enum Stage { S0_NORMAL, S1_MILD, S2_MODERATE, S3_CRITICAL };
+Stage stage            = S0_NORMAL;
+Stage lastPrintedStage = S0_NORMAL;
+
+unsigned long forceStopUntil = 0;
+
+unsigned long lastAudioPlay = 0;
+int           lastAudioCode = -1;
+
+// ─── Debounce tombol ─────────────────────────────────────────────────
+bool recalStable = false, recalLastRaw = false, recalPrevStable = false;
+bool stopStable  = false, stopLastRaw  = false, stopPrevStable  = false;
+unsigned long recalLastChange = 0, stopLastChange = 0;
+
+// ─── Setup ────────────────────────────────────────────────────────────
+void setup() {
+  Serial.begin(9600);
+
+  pinMode(PIN_BUZZER, OUTPUT);
+  pinMode(PIN_MOTOR,  OUTPUT);
+  pinMode(PIN_BTN_RECAL, INPUT);
+  pinMode(PIN_BTN_STOP,  INPUT);
+
+  digitalWrite(PIN_BUZZER, LOW);
+  digitalWrite(PIN_MOTOR, LOW);
+
+  dfSerial.begin(9600);
+  delay(1000);
+
+  if (!dfPlayer.begin(dfSerial, false)) {
+    Serial.println("[DFPlayer] GAGAL — cek kabel, SD card, folder /01/, dan file 001-003.mp3");
+  } else {
+    dfReady = true;
+    dfPlayer.volume(25);
+    dfPlayer.EQ(DFPLAYER_EQ_NORMAL);
+    Serial.println("[DFPlayer] OK — volume 25/30");
+  }
+
+  resetLocalState();
+  startupBeep();
+
+  Serial.println("=== Sistem Peringatan Kantuk v6 ===");
+  Serial.println("Stage (S0-S3) dihitung Python. Arduino cuma menjalankan output.");
+  Serial.println("Sistem AKTIF OTOMATIS. Tombol D2 = re-calibrate. Tombol D3 = force stop.");
+  Serial.println("Serial masuk: 0-3 stage, 4 wajah hilang, 5 fitur wajah hilang.");
+}
+
+void resetLocalState() {
+  stage = S0_NORMAL;
+  lastPrintedStage = S0_NORMAL;
+  inputCode = CMD_S0;
+}
+
+void startupBeep() {
+  for (int i = 0; i < 2; i++) {
+    digitalWrite(PIN_BUZZER, HIGH);
+    delay(120);
+    digitalWrite(PIN_BUZZER, LOW);
+    delay(120);
+  }
+}
+
+// ─── Loop ─────────────────────────────────────────────────────────────
+void loop() {
+  readButtons();
+
+  if (stopPressedEvent()) {
+    forceStopSystem();
+  }
+
+  if (recalPressedEvent()) {
+    sendRecalibrateSignal();
+  }
+
+  readSerialCommand();
+
+  // Setelah FORCE STOP, output diam sebentar lalu lanjut baca stage terbaru dari Python.
+  if (forceStopUntil != 0 && millis() < forceStopUntil) {
+    allOutputsOff();
+    return;
+  } else if (forceStopUntil != 0 && millis() >= forceStopUntil) {
+    forceStopUntil = 0;
+    Serial.println("[FORCE STOP] Selesai — lanjut baca stage dari Python");
+  }
+
+  printStageIfChanged();
+
+  // Warning kamera/fitur wajah punya prioritas lebih tinggi dari stage kantuk.
+  if (inputCode == CMD_NO_FACE) {
+    warningNoFace();
+    return;
+  }
+  if (inputCode == CMD_FEATURE_MISSING) {
+    warningFeatureMissing();
+    return;
+  }
+
+  handleDrowsyAudio();
+  driveDrowsyOutputs();
+}
+
+// ─── Tombol ───────────────────────────────────────────────────────────
+bool rawPressed(int pin) {
+  return digitalRead(pin) == BUTTON_ACTIVE_STATE;
+}
+
+void updateDebouncedButton(int pin, bool &stable, bool &lastRaw, unsigned long &lastChange) {
+  bool raw = rawPressed(pin);
+  unsigned long now = millis();
+  if (raw != lastRaw) {
+    lastRaw = raw;
+    lastChange = now;
+  }
+  if ((now - lastChange) > DEBOUNCE_MS) {
+    stable = raw;
+  }
+}
+
+void readButtons() {
+  recalPrevStable = recalStable;
+  stopPrevStable  = stopStable;
+  updateDebouncedButton(PIN_BTN_RECAL, recalStable, recalLastRaw, recalLastChange);
+  updateDebouncedButton(PIN_BTN_STOP,  stopStable,  stopLastRaw,  stopLastChange);
+}
+
+bool recalPressedEvent() {
+  return recalStable && !recalPrevStable;
+}
+
+bool stopPressedEvent() {
+  return stopStable && !stopPrevStable;
+}
+
+void sendRecalibrateSignal() {
+  Serial.println('R');
+  digitalWrite(PIN_BUZZER, HIGH);
+  delay(80);
+  digitalWrite(PIN_BUZZER, LOW);
+  Serial.println("[BUTTON] RE-CALIBRATE — sinyal 'R' dikirim ke Python");
+}
+
+// Tombol D3: force stop lokal (langsung) + kirim 'F' supaya Python reset fLog/ctr/stage
+// (ini yang dimaksud "tombol feedback masinis" di dokumen bagian 6.1).
+void forceStopSystem() {
+  Serial.println('F');
+  resetLocalState();
+
+  if (dfReady) dfPlayer.stop();
+  lastAudioPlay = 0;
+  lastAudioCode = -1;
+  allOutputsOff();
+
+  forceStopUntil = millis() + FORCE_STOP_SILENT_MS;
+  Serial.println("[BUTTON] FORCE STOP — output mati sesaat + sinyal 'F' terkirim ke Python");
+}
+
+// ─── Serial input dari Python ──────────────────────────────────────────
+void readSerialCommand() {
+  while (Serial.available() > 0) {
+    char c = Serial.read();
+    switch (c) {
+      case '0': inputCode = CMD_S0; stage = S0_NORMAL;   break;
+      case '1': inputCode = CMD_S1; stage = S1_MILD;      break;
+      case '2': inputCode = CMD_S2; stage = S2_MODERATE;  break;
+      case '3': inputCode = CMD_S3; stage = S3_CRITICAL;  break;
+      case '4': inputCode = CMD_NO_FACE;         Serial.println("[INPUT] wajah tidak terdeteksi"); break;
+      case '5': inputCode = CMD_FEATURE_MISSING; Serial.println("[INPUT] mata/mulut/landmark tidak terdeteksi"); break;
+    }
+  }
+}
+
+// ─── Audio ────────────────────────────────────────────────────────────
+unsigned long audioDurationForCode(int code) {
+  if (code == 1) return AUDIO_DROWSY_MS;
+  if (code == 2) return AUDIO_NO_FACE_MS;
+  if (code == 3) return AUDIO_FEATURE_MS;
+  return 1000UL;
+}
+
+bool isAudioBusy() {
+  if (lastAudioPlay == 0) return false;
+  return (millis() - lastAudioPlay) < (audioDurationForCode(lastAudioCode) + AUDIO_REPEAT_MARGIN_MS);
+}
+
+void playAudioCode(int code) {
+  if (!dfReady) return;
+  if (isAudioBusy() && lastAudioCode == code) return;
+  dfPlayer.playFolder(1, code);
+  lastAudioCode = code;
+  lastAudioPlay = millis();
+  Serial.print("[AUDIO] Memutar /01/00");
+  Serial.print(code);
+  Serial.println(".mp3");
+}
+
+void stopAudioIfNormal() {
+  if (!dfReady) return;
+  if (lastAudioCode != -1) {
+    dfPlayer.stop();
+    lastAudioCode = -1;
+    lastAudioPlay = 0;
+    Serial.println("[AUDIO] Stop");
+  }
+}
+
+void handleDrowsyAudio() {
+  if (stage == S0_NORMAL) {
+    stopAudioIfNormal();
+    return;
+  }
+  playAudioCode(1);
+}
+
+// ─── Warning kamera/fitur wajah ───────────────────────────────────────
+void warningNoFace() {
+  pulseMotor(450, 150);
+  beepDouble(100, 100, 700);
+  playAudioCode(2);
+}
+
+void warningFeatureMissing() {
+  pulseMotor(450, 150);
+  beepDouble(100, 100, 700);
+  playAudioCode(3);
+}
+
+// ─── Output per tahap kantuk (stage datang langsung dari Python) ──────
+void driveDrowsyOutputs() {
+  switch (stage) {
+    case S0_NORMAL:
+      digitalWrite(PIN_BUZZER, LOW);
+      digitalWrite(PIN_MOTOR, LOW);
+      break;
+
+    case S1_MILD:
+      beepSingle(100, 2000);
+      digitalWrite(PIN_MOTOR, LOW);
+      break;
+
+    case S2_MODERATE:
+      beepDouble(120, 160, 1200);
+      pulseMotor(300, 300);
+      break;
+
+    case S3_CRITICAL:
+      beepSingle(220, 380);
+      pulseMotor(450, 80);
+      break;
+  }
+}
+
+// ─── Buzzer patterns ──────────────────────────────────────────────────
+void beepSingle(unsigned long onMs, unsigned long periodMs) {
+  unsigned long phase = millis() % periodMs;
+  digitalWrite(PIN_BUZZER, phase < onMs ? HIGH : LOW);
+}
+
+void beepDouble(unsigned long beepMs, unsigned long gapMs, unsigned long periodMs) {
+  unsigned long phase   = millis() % periodMs;
+  unsigned long b2Start = beepMs + gapMs;
+  unsigned long b2End   = b2Start + beepMs;
+  bool on = (phase < beepMs) || (phase >= b2Start && phase < b2End);
+  digitalWrite(PIN_BUZZER, on ? HIGH : LOW);   
+}
+
+// ─── Motor ────────────────────────────────────────────────────────────
+void pulseMotor(unsigned long onMs, unsigned long offMs) {
+  unsigned long phase = millis() % (onMs + offMs);
+  digitalWrite(PIN_MOTOR, phase < onMs ? HI  GH : LOW);
+}
+
+void allOutputsOff() {
+  digitalWrite(PIN_BUZZER, LOW);
+  digitalWrite(PIN_MOTOR, LOW);
+}
+
+// ─── Log stage ────────────────────────────────────────────────────────
+void printStageIfChanged() {
+  if (stage == lastPrintedStage) return;
+  Serial.print("[STAGE] ");
+  switch (stage) {
+    case S0_NORMAL:   Serial.println("S0 — Normal (semua output mati)");          break;
+    case S1_MILD:     Serial.println("S1 — Mild    (buzzer pelan, motor mati)");  break;
+    case S2_MODERATE: Serial.println("S2 — Moderate (buzzer ganda + motor)");     break;
+    case S3_CRITICAL: Serial.println("S3 — CRITICAL (buzzer cepat + motor kuat)"); break;
+  }
+  lastPrintedStage = stage;
+}
